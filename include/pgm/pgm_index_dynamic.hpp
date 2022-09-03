@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <iterator>
 #include <limits>
@@ -54,16 +55,94 @@ class DynamicPGMIndex {
     // this is only accessed in write operations, and since we have a single writer, needs no protection
     size_t buffer_max_size;        ///< Size of the combined upper levels, i.e. max_size(0) + ... + max_size(min_level).
 
-    uint8_t _used_levels;           ///< Equal to 1 + last level whose size is greater than 0, or = min_level if no data.
-    std::vector<std::shared_ptr<Level>> _levels;     ///< (i-min_level)th element is the data array at the ith level.
-    std::vector<std::shared_ptr<PGMType>> _pgms;     ///< (i-min_index_level)th element is the index at the ith level.
+    struct State {
+        uint8_t _used_levels;           ///< Equal to 1 + last level whose size is greater than 0, or = min_level if no data.
+        std::vector<std::shared_ptr<Level>> _levels;     ///< (i-min_level)th element is the data array at the ith level.
+        std::vector<std::shared_ptr<PGMType>> _pgms;     ///< (i-min_index_level)th element is the index at the ith level.
+    };
+    std::shared_ptr<State> published_state;
 
-    std::vector<std::shared_ptr<Level>>& get_levels() { return _levels; }
-    const std::vector<std::shared_ptr<Level>>& get_levels() const { return _levels; }
-    std::vector<std::shared_ptr<PGMType>>& get_pgms() { return _pgms; }
-    const std::vector<std::shared_ptr<PGMType>>& get_pgms() const { return _pgms; }
-    uint8_t get_used_levels() { return _used_levels; }
-    const uint8_t get_used_levels() const { return _used_levels; }
+
+    enum OpType {
+        None,
+        Read,
+        Write,
+    };
+    static OpType* get_optype() {
+        thread_local OpType optype = OpType::None;
+        return &optype;
+    }
+
+    static std::shared_ptr<State>* do_get_state() {
+        thread_local std::shared_ptr<State> state;
+        return &state;
+    }
+
+    static State& get_state() {
+        std::shared_ptr<State>* state = do_get_state();
+        assert(*state);
+        return **state;
+    }
+
+    // return true if actually entered and need to exit later
+    bool enter_read() const {
+        auto optype = get_optype();
+        if (*optype != OpType::None) return false;
+        *optype = OpType::Read;
+
+        *do_get_state() = std::atomic_load_explicit(&published_state, std::memory_order_acquire);
+        return true;
+    }
+
+    // return true if actually entered and need to exit later
+    bool enter_write() {
+        auto optype = get_optype();
+        if (*optype == OpType::Write) return false;
+        *optype = OpType::Write;
+
+        auto last_state = std::atomic_load_explicit(&published_state, std::memory_order_acquire);
+        *do_get_state() = std::make_shared<State>(*last_state);
+        return true;
+    }
+
+    void leave_read() const {
+        do_get_state()->reset();
+
+        auto optype = get_optype();
+        assert(*optype == OpType::Read);
+        *optype = OpType::None;
+    }
+
+    void leave_write() {
+        auto state = do_get_state();
+        std::atomic_store_explicit(&published_state, *state, std::memory_order_release);
+
+        auto optype = get_optype();
+        assert(*optype == OpType::Write);
+        *optype = OpType::None;
+    }
+
+    struct ReadGuard {
+        const DynamicPGMIndex<K, V, PGMType>* x;
+        bool active;
+        ReadGuard(const DynamicPGMIndex<K, V, PGMType>* y) : x(y) { active = x->enter_read(); }
+        ~ReadGuard() { if(active) x->leave_read(); }
+    };
+
+    struct WriteGuard {
+        DynamicPGMIndex<K, V, PGMType>* x;
+        bool active;
+        WriteGuard(DynamicPGMIndex<K, V, PGMType>* y) : x(y) { active = x->enter_write(); }
+        ~WriteGuard() { if(active) x->leave_write(); }
+    };
+
+    std::vector<std::shared_ptr<Level>>& get_levels() { return get_state()._levels; }
+    const std::vector<std::shared_ptr<Level>>& get_levels() const { return get_state()._levels; }
+    std::vector<std::shared_ptr<PGMType>>& get_pgms() { return get_state()._pgms; }
+    const std::vector<std::shared_ptr<PGMType>>& get_pgms() const { return get_state()._pgms; }
+    uint8_t get_used_levels() { return get_state()._used_levels; }
+    const uint8_t get_used_levels() const { return get_state()._used_levels; }
+    void set_used_levels(uint8_t val) { get_state()._used_levels = val; }
 
     const Level &level(uint8_t level) const { return *(get_levels()[level - min_level]); }
     const PGMType &pgm(uint8_t level) const { return *(get_pgms()[level - min_index_level]); }
@@ -128,8 +207,7 @@ class DynamicPGMIndex {
 
         if (level(min_level).size() < buffer_max_size) {
             level(min_level).insert(insertion_point, new_item);
-            auto used_levels_ref = get_used_levels();
-            used_levels_ref = get_used_levels() == min_level ? min_level + 2 : get_used_levels();
+            set_used_levels(get_used_levels() == min_level ? min_level + 2 : get_used_levels());
             return;
         }
 
@@ -144,8 +222,7 @@ class DynamicPGMIndex {
 
         auto need_new_level = i == get_used_levels();
         if (need_new_level) {
-            auto used_levels_ref = get_used_levels();
-            ++used_levels_ref;
+            set_used_levels(get_used_levels() + 1);
             get_levels().emplace_back(std::make_shared<Level>());
             if (i - min_index_level >= int(get_pgms().size()))
                 get_pgms().emplace_back(std::make_shared<PGMType>());
@@ -173,19 +250,21 @@ public:
           min_level(buffer_level ? buffer_level : ceil_log_base(128) - (base == 2)),
           min_index_level(std::max<size_t>(min_level + 1, index_level ? index_level : ceil_log_base(size_t(1) << 24))),
           buffer_max_size(),
-          _used_levels(min_level),
-          _levels(),
-          _pgms() {
+          published_state(std::make_shared<State>()) {
+
+        WriteGuard wg {this};
+        published_state->_used_levels = min_level;
+
         if (base < 2 || (base & (base - 1u)) != 0)
             throw std::invalid_argument("base must be a power of two");
 
         for (auto j = 0; j <= min_level; ++j)
             buffer_max_size += max_size(j);
 
-        while(_levels.size() < 32 - _used_levels) {
-            _levels.emplace_back(std::make_shared<Level>());
+        while(get_levels().size() < 32 - get_used_levels()) {
+            get_levels().emplace_back(std::make_shared<Level>());
         }
-        assert(_levels.size() == 32 - _used_levels);
+        assert(get_levels().size() == 32 - get_used_levels());
 
         level(min_level).reserve(buffer_max_size);
         for (uint8_t i = min_level + 1; i < max_fully_allocated_level(); ++i)
@@ -203,26 +282,31 @@ public:
     template<typename Iterator>
     DynamicPGMIndex(Iterator first, Iterator last, uint8_t base = 8, uint8_t buffer_level = 0, uint8_t index_level = 0)
         : DynamicPGMIndex(base, buffer_level, index_level) {
+        WriteGuard wg {this};
         size_t n = std::distance(first, last);
-        _used_levels = std::max<uint8_t>(ceil_log_base(n), min_level) + 1;
+        set_used_levels(std::max<uint8_t>(ceil_log_base(n), min_level) + 1);
 
-        auto s = std::max<uint8_t>(_used_levels, 32) - min_level + 1;
-        while(_levels.size() < s) {
-            _levels.emplace_back(std::make_shared<Level>());
+        // this used to be a call to resize, but the default ctor for shared_ptr is null ptr and not make_shared()
+        auto s = std::max<uint8_t>(get_used_levels(), 32) - min_level + 1;
+        while(get_levels().size() < s) {
+            get_levels().emplace_back(std::make_shared<Level>());
         }
-        assert(_levels.size() == s);
+        while(get_levels().size() > s) {
+            get_levels().pop_back();
+        }
+        assert(get_levels().size() == s);
 
         level(min_level).reserve(buffer_max_size);
         for (uint8_t i = min_level + 1; i < max_fully_allocated_level(); ++i)
             level(i).reserve(max_size(i));
 
         if (n == 0) {
-            _used_levels = min_level;
+            set_used_levels(min_level);
             return;
         }
 
         // Copy only the first of each group of pairs with same key value
-        auto &target = level(_used_levels - 1);
+        auto &target = level(get_used_levels() - 1);
         target.resize(n);
         auto out = target.begin();
         *out++ = Item(first->first, first->second);
@@ -234,9 +318,15 @@ public:
         }
         target.resize(std::distance(target.begin(), out));
 
-        if (has_pgm(_used_levels - 1)) {
-            _pgms = decltype(_pgms)(_used_levels - min_index_level);
-            pgm(_used_levels - 1) = PGMType(target.begin(), target.end());
+        if (has_pgm(get_used_levels() - 1)) {
+            // this used to be a call to resize, but the default ctor for shared_ptr is null ptr and not make_shared()
+            while (get_state()._pgms.size() < get_used_levels() - min_index_level) {
+                get_state()._pgms.emplace_back(std::make_shared<PGMType>());
+            }
+            while (get_state()._pgms.size() > get_used_levels() - min_index_level) {
+                get_state()._pgms.pop_back();
+            }
+            pgm(get_used_levels() - 1) = PGMType(target.begin(), target.end());
         }
     }
 
@@ -246,13 +336,13 @@ public:
      * @param key element key to insert or update
      * @param value element value to insert
      */
-    void insert_or_assign(const K &key, const V &value) { insert(Item(key, value)); }
+    void insert_or_assign(const K &key, const V &value) { ReadGuard rg {this}; insert(Item(key, value)); }
 
     /**
      * Removes the specified element from the container.
      * @param key key value of the element to remove
      */
-    void erase(const K &key) { insert(Item(key)); }
+    void erase(const K &key) { ReadGuard rg {this}; insert(Item(key)); }
 
     /**
      * Finds an element with key equivalent to @p key.
@@ -260,6 +350,7 @@ public:
      * @return an iterator to an element with key equivalent to @p key. If no such element is found, end() is returned
      */
     iterator find(const K &key) const {
+        ReadGuard rg {this};
         for (auto i = min_level; i < get_used_levels(); ++i) {
             if (level(i).empty())
                 continue;
@@ -287,6 +378,7 @@ public:
      * @return a vector of key-value pairs satisfying the range query
      */
     std::vector<std::pair<K, V>> range(const K &lo, const K &hi) const {
+        ReadGuard rg {this};
         if (lo > hi)
             throw std::invalid_argument("lo > hi");
 
@@ -342,6 +434,7 @@ public:
      * @return an iterator to an element with key not less than @p key. If no such element is found, end() is returned
      */
     iterator lower_bound(const K &key) const {
+        ReadGuard rg {this};
         typename Level::const_iterator lb;
         auto lb_set = false;
         uint8_t lb_level;
@@ -383,19 +476,19 @@ public:
      * Checks if the container has no elements, i.e. whether begin() == end().
      * @return true if the container is empty, false otherwise
      */
-    bool empty() const { return begin() == end(); }
+    bool empty() const { ReadGuard rg {this}; return begin() == end(); }
 
     /**
      * Returns an iterator to the beginning.
      * @return an iterator to the beginning
      */
-    iterator begin() const { return lower_bound(std::numeric_limits<K>::min()); }
+    iterator begin() const { ReadGuard rg {this}; return lower_bound(std::numeric_limits<K>::min()); }
 
     /**
      * Returns an iterator to the end.
      * @return an iterator to the end
      */
-    iterator end() const { return iterator(this, get_levels().size() - 1, (*get_levels().back()).end()); }
+    iterator end() const { ReadGuard rg {this}; return iterator(this, get_levels().size() - 1, (*get_levels().back()).end()); }
 
     /**
      * Returns the number of elements with key that compares equal to the specified argument key, which is either 1
@@ -403,7 +496,7 @@ public:
      * @param key key value of the elements to count
      * @return number of elements with the given key, which is either 1 or 0.
      */
-    size_t count(const K &key) const { return find(key) == end() ? 0 : 1; }
+    size_t count(const K &key) const { ReadGuard rg {this}; return find(key) == end() ? 0 : 1; }
 
     /**
      * Returns the number of elements in the container.
@@ -411,6 +504,7 @@ public:
      */
     size_t size() const {
         // TODO: scanning the levels and using a hash table for the encountered keys could be more time efficient
+        ReadGuard rg {this};
         return std::distance(begin(), end());
     }
 
@@ -419,6 +513,7 @@ public:
      * @return the size of the container in bytes
      */
     size_t size_in_bytes() const {
+        ReadGuard rg {this};
         size_t bytes = get_levels().size() * sizeof(Level);
         for (auto &l: get_levels())
             bytes += (*l).size() * sizeof(Item);
@@ -430,6 +525,7 @@ public:
      * @return the size of the index used in this container in bytes
      */
     size_t index_size_in_bytes() const {
+        ReadGuard rg {this};
         size_t bytes = 0;
         for (auto &p: get_pgms())
             bytes += (*p).size_in_bytes();
@@ -658,7 +754,7 @@ class DynamicPGMIndex<K, V, PGMType>::Iterator {
 
 public:
 
-    using difference_type = typename decltype(_levels)::difference_type;
+    using difference_type = typename std::vector<Level>::difference_type;
     using value_type = const Item;
     using pointer = const Item *;
     using reference = const Item &;
