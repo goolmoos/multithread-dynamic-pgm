@@ -55,19 +55,19 @@ class DynamicPGMIndex {
     size_t buffer_max_size;        ///< Size of the combined upper levels, i.e. max_size(0) + ... + max_size(min_level).
 
     uint8_t _used_levels;           ///< Equal to 1 + last level whose size is greater than 0, or = min_level if no data.
-    std::vector<Level> _levels;     ///< (i-min_level)th element is the data array at the ith level.
+    std::vector<std::shared_ptr<Level>> _levels;     ///< (i-min_level)th element is the data array at the ith level.
     std::vector<PGMType> _pgms;     ///< (i-min_index_level)th element is the index at the ith level.
 
-    std::vector<Level>& get_levels() { return _levels; }
-    const std::vector<Level>& get_levels() const { return _levels; }
+    std::vector<std::shared_ptr<Level>>& get_levels() { return _levels; }
+    const std::vector<std::shared_ptr<Level>>& get_levels() const { return _levels; }
     std::vector<PGMType>& get_pgms() { return _pgms; }
     const std::vector<PGMType>& get_pgms() const { return _pgms; }
     uint8_t get_used_levels() { return _used_levels; }
     const uint8_t get_used_levels() const { return _used_levels; }
 
-    const Level &level(uint8_t level) const { return get_levels()[level - min_level]; }
+    const Level &level(uint8_t level) const { return *(get_levels()[level - min_level]); }
     const PGMType &pgm(uint8_t level) const { return get_pgms()[level - min_index_level]; }
-    Level &level(uint8_t level) { return get_levels()[level - min_level]; }
+    Level &level(uint8_t level) { return *(get_levels()[level - min_level]); }
     PGMType &pgm(uint8_t level) { return get_pgms()[level - min_index_level]; }
     bool has_pgm(uint8_t level) const { return level >= min_index_level; }
     size_t max_size(uint8_t level) const { return size_t(1) << (level * ceil_log2(base)); }
@@ -84,9 +84,9 @@ class DynamicPGMIndex {
 
         // Insert new_item in sorted order in the first level
         auto alternate = true;
-        auto it = std::move(level(min_level).begin(), insertion_point, tmp_a.begin());
+        auto it = std::copy(level(min_level).begin(), insertion_point, tmp_a.begin());
         *it++ = new_item;
-        it = std::move(insertion_point, level(min_level).end(), it);
+        it = std::copy(insertion_point, level(min_level).end(), it);
         auto tmp_size = std::distance(tmp_a.begin(), it);
 
         // Merge subsequent levels
@@ -99,21 +99,19 @@ class DynamicPGMIndex {
 
             auto can_delete_permanently = i == get_used_levels()- 1;
             if (can_delete_permanently)
-                out_end = merge<true, true>(tmp_begin, tmp_end, level(i).begin(), level(i).end(), out_begin);
+                out_end = merge<true, false>(tmp_begin, tmp_end, level(i).begin(), level(i).end(), out_begin);
             else
-                out_end = merge<false, true>(tmp_begin, tmp_end, level(i).begin(), level(i).end(), out_begin);
+                out_end = merge<false, false>(tmp_begin, tmp_end, level(i).begin(), level(i).end(), out_begin);
             tmp_size = std::distance(out_begin, out_end);
 
             // Empty this level and the corresponding index
-            level(i).clear();
-            if (i >= max_fully_allocated_level())
-                level(i).shrink_to_fit();
+            get_levels()[i] = std::make_shared<Level>();
             if (has_pgm(i))
                 pgm(i) = PGMType();
         }
 
-        level(min_level).clear();
-        level(target) = std::move(alternate ? tmp_a : tmp_b);
+        get_levels()[min_level] = std::make_shared<Level>();
+        get_levels()[target] = std::make_shared<Level>(std::move(alternate ? tmp_a : tmp_b));
         level(target).resize(tmp_size);
 
         // Rebuild index, if needed
@@ -148,7 +146,7 @@ class DynamicPGMIndex {
         if (need_new_level) {
             auto used_levels_ref = get_used_levels();
             ++used_levels_ref;
-            get_levels().emplace_back();
+            get_levels().emplace_back(std::make_shared<Level>());
             if (i - min_index_level >= int(get_pgms().size()))
                 get_pgms().emplace_back();
         }
@@ -184,7 +182,11 @@ public:
         for (auto j = 0; j <= min_level; ++j)
             buffer_max_size += max_size(j);
 
-        _levels.resize(32 - _used_levels);
+        while(_levels.size() < 32 - _used_levels) {
+            _levels.emplace_back(std::make_shared<Level>());
+        }
+        assert(_levels.size() == 32 - _used_levels);
+
         level(min_level).reserve(buffer_max_size);
         for (uint8_t i = min_level + 1; i < max_fully_allocated_level(); ++i)
             level(i).reserve(max_size(i));
@@ -203,7 +205,13 @@ public:
         : DynamicPGMIndex(base, buffer_level, index_level) {
         size_t n = std::distance(first, last);
         _used_levels = std::max<uint8_t>(ceil_log_base(n), min_level) + 1;
-        _levels.resize(std::max<uint8_t>(_used_levels, 32) - min_level + 1);
+
+        auto s = std::max<uint8_t>(_used_levels, 32) - min_level + 1;
+        while(_levels.size() < s) {
+            _levels.emplace_back(std::make_shared<Level>());
+        }
+        assert(_levels.size() == s);
+
         level(min_level).reserve(buffer_max_size);
         for (uint8_t i = min_level + 1; i < max_fully_allocated_level(); ++i)
             level(i).reserve(max_size(i));
@@ -387,7 +395,7 @@ public:
      * Returns an iterator to the end.
      * @return an iterator to the end
      */
-    iterator end() const { return iterator(this, get_levels().size() - 1, get_levels().back().end()); }
+    iterator end() const { return iterator(this, get_levels().size() - 1, (*get_levels().back()).end()); }
 
     /**
      * Returns the number of elements with key that compares equal to the specified argument key, which is either 1
@@ -413,7 +421,7 @@ public:
     size_t size_in_bytes() const {
         size_t bytes = get_levels().size() * sizeof(Level);
         for (auto &l: get_levels())
-            bytes += l.size() * sizeof(Item);
+            bytes += (*l).size() * sizeof(Item);
         return index_size_in_bytes() + bytes;
     }
 
