@@ -56,19 +56,19 @@ class DynamicPGMIndex {
 
     uint8_t _used_levels;           ///< Equal to 1 + last level whose size is greater than 0, or = min_level if no data.
     std::vector<std::shared_ptr<Level>> _levels;     ///< (i-min_level)th element is the data array at the ith level.
-    std::vector<PGMType> _pgms;     ///< (i-min_index_level)th element is the index at the ith level.
+    std::vector<std::shared_ptr<PGMType>> _pgms;     ///< (i-min_index_level)th element is the index at the ith level.
 
     std::vector<std::shared_ptr<Level>>& get_levels() { return _levels; }
     const std::vector<std::shared_ptr<Level>>& get_levels() const { return _levels; }
-    std::vector<PGMType>& get_pgms() { return _pgms; }
-    const std::vector<PGMType>& get_pgms() const { return _pgms; }
+    std::vector<std::shared_ptr<PGMType>>& get_pgms() { return _pgms; }
+    const std::vector<std::shared_ptr<PGMType>>& get_pgms() const { return _pgms; }
     uint8_t get_used_levels() { return _used_levels; }
     const uint8_t get_used_levels() const { return _used_levels; }
 
     const Level &level(uint8_t level) const { return *(get_levels()[level - min_level]); }
-    const PGMType &pgm(uint8_t level) const { return get_pgms()[level - min_index_level]; }
+    const PGMType &pgm(uint8_t level) const { return *(get_pgms()[level - min_index_level]); }
     Level &level(uint8_t level) { return *(get_levels()[level - min_level]); }
-    PGMType &pgm(uint8_t level) { return get_pgms()[level - min_index_level]; }
+    PGMType &pgm(uint8_t level) { return *(get_pgms()[level - min_index_level]); }
     bool has_pgm(uint8_t level) const { return level >= min_index_level; }
     size_t max_size(uint8_t level) const { return size_t(1) << (level * ceil_log2(base)); }
     uint8_t max_fully_allocated_level() const { return min_level + 2; }
@@ -107,7 +107,7 @@ class DynamicPGMIndex {
             // Empty this level and the corresponding index
             get_levels()[i] = std::make_shared<Level>();
             if (has_pgm(i))
-                pgm(i) = PGMType();
+                get_pgms()[i] = std::make_shared<PGMType>();
         }
 
         get_levels()[min_level] = std::make_shared<Level>();
@@ -116,7 +116,7 @@ class DynamicPGMIndex {
 
         // Rebuild index, if needed
         if (has_pgm(target))
-            pgm(target) = PGMType(level(target).begin(), level(target).end());
+            get_pgms()[target] = std::make_shared<PGMType>(level(target).begin(), level(target).end());
     }
 
     void insert(const Item &new_item) {
@@ -148,7 +148,7 @@ class DynamicPGMIndex {
             ++used_levels_ref;
             get_levels().emplace_back(std::make_shared<Level>());
             if (i - min_index_level >= int(get_pgms().size()))
-                get_pgms().emplace_back();
+                get_pgms().emplace_back(std::make_shared<PGMType>());
         }
 
         pairwise_merge(new_item, i, slots_required, insertion_point);
@@ -432,7 +432,7 @@ public:
     size_t index_size_in_bytes() const {
         size_t bytes = 0;
         for (auto &p: get_pgms())
-            bytes += p.size_in_bytes();
+            bytes += (*p).size_in_bytes();
         return bytes;
     }
 
