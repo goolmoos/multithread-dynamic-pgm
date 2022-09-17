@@ -22,6 +22,16 @@
     <a href="https://repl.it/github/gvinciguerra/PGM-index"><img alt="Run on Repl.it" src="https://img.shields.io/badge/run-examples-667881?logo=repl.it&logoColor=white"></a>
 </p>
 
+## How to compile the benchmark
+
+run:
+```bash
+g++ project-benchmark.cpp -std=c++17 -I./include -o ./project-benchmark -lpthread wormhole/libwh.so -O3
+```
+This builds the tester, two python files are also provided, and can be used for:
+* running a very long benchmark
+* rearranging the data from it to a nice format that cna be used easily with msexcel to create graphs.
+
 ## Quickstart
 
 This is a header-only library. It does not need to be installed. Just clone the repo with
